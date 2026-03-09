@@ -9,7 +9,7 @@ Fire a slot and norns will load the script, recall the PSET, and configure the c
 ## Installation
 
 In maiden's REPL:
-`;install https://github.com/YOUR_USERNAME/setlist`
+`;install https://github.com/innovativedom/setlist`
 
 Or copy the folder to `~/dust/code/setlist/`.
 
