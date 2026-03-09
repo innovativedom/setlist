@@ -252,26 +252,77 @@ local function setup_midi()
 end
 
 -- ---------------------------------------------------------------------------
--- Keyboard listener (injected via system_post_startup hook)
+-- Keyboard listener — hook keyboard.event to capture keys even when menu is open
 -- ---------------------------------------------------------------------------
 
--- Captures CURRENT handler at call time (not startup) so we properly re-chain
--- each time a new script overwrites keyboard.code (e.g. in script_post_init).
+-- Map HID key code (number) to our KEY_OPTIONS format. Skip modifiers.
+local function hid_code_to_key_name(code)
+  if not code then return nil end
+  local codes = keyboard.codes
+  if not codes then return tostring(code) end  -- fallback if codes table missing
+  local name = codes[code]
+  if not name then return nil end
+  -- Skip modifier keys
+  if name:find("SHIFT") or name:find("CTRL") or name:find("ALT") or name:find("META") then
+    return nil
+  end
+  -- Normalize: F1 -> F1, Q -> q, SPACE -> SPACE, etc.
+  if name:match("^F%d+$") then
+    return name  -- F6, F7, etc.
+  end
+  if name:match("^%d$") then return name end  -- 1-9
+  if name == "0" then return "0" end
+  if name:match("^[A-Z]$") and #name == 1 then
+    return name:lower()  -- Q -> q
+  end
+  if name == "SPACE" then return "SPACE" end
+  if name == "ENTER" or name == "RETURN" then return "ENTER" end
+  if name == "TAB" then return "TAB" end
+  if name == "UP" or name == "ARROWUP" then return "UP" end
+  if name == "DOWN" or name == "ARROWDOWN" then return "DOWN" end
+  if name == "LEFT" or name == "ARROWLEFT" then return "LEFT" end
+  if name == "RIGHT" or name == "ARROWRIGHT" then return "RIGHT" end
+  return name
+end
+
+local norns_keyboard_event = nil
+
 local function setup_keyboard()
-  local existing = keyboard.code  -- capture CURRENT handler, not startup handler
-  keyboard.code = function(code, value)
-    if value == 1 then
-      -- Learn mode: capture next keypress for key field
-      if state.learning_key then
+  -- Hook keyboard.event (raw HID events) so we receive keys even when menu is open
+  if not norns_keyboard_event then
+    norns_keyboard_event = keyboard.event
+  end
+  keyboard.event = function(typ, code, val)
+    -- Learn mode: capture keydown before anything else
+    if state.learning_key and (val == 1 or val == 2) then
+      local key_name = hid_code_to_key_name(code)
+      if key_name then
         local slot = state.banks[state.current_bank][state.current_slot]
         if slot then
-          slot.key = tostring(code)
+          slot.key = key_name
           state.learning_key = false
-          print("setlist: learned key " .. tostring(code))
+          print("setlist: learned key " .. key_name)
+          mod.menu.redraw()
         end
-        mod.menu.redraw()
-        return
+        return  -- consume event
       end
+    end
+    -- Chain to default handler (which calls keyboard.code).
+    -- If no original, invoke keyboard.code ourselves so scripts still receive events.
+    if norns_keyboard_event then
+      norns_keyboard_event(typ, code, val)
+    elseif val == 1 or val == 2 then
+      local name = hid_code_to_key_name(code)
+      if name and keyboard.code then
+        keyboard.code(name, val)
+      end
+    end
+  end
+
+  -- Also wrap keyboard.code for normal trigger firing
+  local existing = keyboard.code
+  keyboard.code = function(code, value)
+    if value == 1 then
       for s = 1, NUM_SLOTS do
         local slot = state.banks[state.current_bank][s]
         if slot.trigger_type == "keyboard" and slot.key == tostring(code) then
@@ -437,21 +488,22 @@ m.enc = function(n, d)
   local slot = state.banks[state.current_bank][state.current_slot]
 
   if n == 2 then
-    -- E2: scroll through fields (edit page only)
-    if menu_page == PAGE_EDIT then
+    -- E2: scroll vertically through list on all pages
+    if menu_page == PAGE_BANK then
+      menu_pos = util.clamp(menu_pos + d, 1, NUM_BANKS)
+    elseif menu_page == PAGE_SLOT then
+      menu_pos = util.clamp(menu_pos + d, 1, NUM_SLOTS)
+    elseif menu_page == PAGE_SCRIPT_BROWSE then
+      local list = get_script_list()
+      script_browse_pos = util.clamp(script_browse_pos + d, 1, #list)
+    elseif menu_page == PAGE_EDIT then
       local fields = get_edit_fields(slot)
       edit_field = util.clamp(edit_field + d, 1, #fields)
     end
 
   elseif n == 3 then
-    -- E3: scroll/change value
-    if menu_page == PAGE_BANK then
-      menu_pos = util.clamp(menu_pos + d, 1, NUM_BANKS)
-
-    elseif menu_page == PAGE_SLOT then
-      menu_pos = util.clamp(menu_pos + d, 1, NUM_SLOTS)
-
-    elseif menu_page == PAGE_EDIT then
+    -- E3: change value of selected field (edit page, settings)
+    if menu_page == PAGE_EDIT then
       local fields = get_edit_fields(slot)
       local field = fields[edit_field]
 
@@ -486,10 +538,6 @@ m.enc = function(n, d)
       end
       -- fire field is display-only, no E3 change
 
-    elseif menu_page == PAGE_SCRIPT_BROWSE then
-      local list = get_script_list()
-      script_browse_pos = util.clamp(script_browse_pos + d, 1, #list)
-
     elseif menu_page == PAGE_SETTINGS then
       state.midi_device = util.clamp(state.midi_device + d, 1, 4)
       setup_midi()
@@ -511,12 +559,6 @@ m.redraw = function()
     screen.level(15)
     screen.move(2, 24)
     screen.text("> " .. menu_pos)
-    screen.level(3)
-    screen.move(2, 50)
-    screen.text("E3: change  K3: select")
-    screen.level(2)
-    screen.move(2, 62)
-    screen.text("active: b" .. state.current_bank .. " s" .. state.current_slot)
 
   elseif menu_page == PAGE_SLOT then
     screen.level(15)
@@ -531,13 +573,13 @@ m.redraw = function()
       local label = s .. ": "
       if slot.script ~= "" then
         label = label .. get_script_name(slot.script)
-        if slot.trigger_type == "keyboard" and slot.key ~= "none" then
-          label = label .. " [" .. slot.key .. "]"
-        elseif slot.trigger_type == "midi_pc" then
-          label = label .. " [PC" .. slot.midi_pc .. "]"
-        end
       else
         label = label .. "---"
+      end
+      if slot.trigger_type == "keyboard" and slot.key ~= "none" then
+        label = label .. " [" .. slot.key .. "]"
+      elseif slot.trigger_type == "midi_pc" then
+        label = label .. " [PC" .. slot.midi_pc .. "]"
       end
       if s == menu_pos then
         screen.level(15)
@@ -549,9 +591,6 @@ m.redraw = function()
         screen.text(label)
       end
     end
-    screen.level(3)
-    screen.move(2, 62)
-    screen.text("E3: scroll  K3: select slot")
 
   elseif menu_page == PAGE_SCRIPT_BROWSE then
     screen.level(15)
@@ -574,9 +613,6 @@ m.redraw = function()
         screen.text(label)
       end
     end
-    screen.level(3)
-    screen.move(2, 62)
-    screen.text("E3: scroll  K3: select  K2: back")
 
   elseif menu_page == PAGE_EDIT then
     local slot = state.banks[state.current_bank][state.current_slot]
@@ -622,9 +658,6 @@ m.redraw = function()
         screen.text(name .. ": " .. label)
       end
     end
-    screen.level(2)
-    screen.move(2, 62)
-    screen.text("E2: field  E3: change  K3: action")
 
   elseif menu_page == PAGE_SETTINGS then
     screen.level(15)
@@ -636,9 +669,6 @@ m.redraw = function()
     screen.level(3)
     screen.move(4, 40)
     screen.text("(for PC triggers)")
-    screen.level(3)
-    screen.move(2, 62)
-    screen.text("K2: back  E3: change")
   end
 
   screen.update()
