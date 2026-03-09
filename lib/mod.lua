@@ -1,20 +1,19 @@
 -- setlist
--- v0.1.0
+-- v0.2.0
 -- A live performance mod for norns.
 -- Organizes scripts + PSETs into 16 banks of 16 slots.
 -- Each slot can be triggered by a keyboard key or MIDI program change.
--- Trigger fires: script load → PSET recall → clock config.
 
 local mod = require 'core/mods'
 
 -- ---------------------------------------------------------------------------
--- Constants
+-- Constants (DATA_PATH/SAVE_FILE set in system_post_startup — _path not ready at mod load)
 -- ---------------------------------------------------------------------------
 
 local NUM_BANKS = 16
 local NUM_SLOTS = 16
-local DATA_PATH = _path.data .. 'setlist/'
-local SAVE_FILE = DATA_PATH .. 'setlist.lua'
+local DATA_PATH = nil
+local SAVE_FILE = nil
 
 -- Available keyboard trigger keys (F1-F4 are reserved by system, so F6-F12 + others)
 local KEY_OPTIONS = {
@@ -69,60 +68,69 @@ local function init_banks()
 end
 
 -- ---------------------------------------------------------------------------
--- Persistence
+-- Persistence — plain Lua serialization via serpent (ships with norns)
 -- ---------------------------------------------------------------------------
 
+local serpent = require 'serpent'
+
 local function ensure_data_dir()
-  if not util.file_exists(DATA_PATH) then
+  if DATA_PATH and not util.file_exists(DATA_PATH) then
     util.make_dir(DATA_PATH)
   end
 end
 
--- Use tab.save/tab.load (norns built-in) for plain Lua table serialization — no external dep
 local function save_data()
+  if not DATA_PATH then return end
   ensure_data_dir()
-  local ok = tab.save({
+  local payload = {
     banks = state.banks,
     current_bank = state.current_bank,
     current_slot = state.current_slot,
     midi_device = state.midi_device,
-  }, SAVE_FILE)
-  if ok then
-    print("setlist: saved to " .. SAVE_FILE)
+  }
+  local f = io.open(SAVE_FILE, 'w')
+  if f then
+    f:write("return " .. serpent.block(payload, {comment = false}))
+    f:close()
+    print("setlist: saved -> " .. SAVE_FILE)
   else
     print("setlist: ERROR could not write " .. SAVE_FILE)
   end
 end
 
 local function load_data()
-  if util.file_exists(SAVE_FILE) then
-    local decoded = tab.load(SAVE_FILE)
-    if decoded then
-        -- Merge loaded data, filling missing slots with defaults
-        if decoded.banks then
-          for b = 1, NUM_BANKS do
-            if decoded.banks[b] then
-              for s = 1, NUM_SLOTS do
-                if decoded.banks[b][s] then
-                  local loaded = decoded.banks[b][s]
-                  local slot = default_slot()
-                  for k, v in pairs(loaded) do slot[k] = v end
-                  state.banks[b][s] = slot
-                end
-              end
-            end
+  if not SAVE_FILE then return end
+  if not util.file_exists(SAVE_FILE) then
+    print("setlist: no save file, using defaults")
+    return
+  end
+  local fn, err = loadfile(SAVE_FILE)
+  if not fn then
+    print("setlist: ERROR loading save file: " .. tostring(err))
+    return
+  end
+  local ok, data = pcall(fn)
+  if not ok or type(data) ~= "table" then
+    print("setlist: ERROR parsing save file")
+    return
+  end
+  if data.banks then
+    for b = 1, NUM_BANKS do
+      if data.banks[b] then
+        for s = 1, NUM_SLOTS do
+          if data.banks[b][s] then
+            local slot = default_slot()
+            for k, v in pairs(data.banks[b][s]) do slot[k] = v end
+            state.banks[b][s] = slot
           end
         end
-        state.current_bank = decoded.current_bank or 1
-        state.current_slot = decoded.current_slot or 1
-        state.midi_device = decoded.midi_device or 1
-        print("setlist: loaded from " .. SAVE_FILE)
-    else
-      print("setlist: ERROR parsing save file, using defaults")
+      end
     end
-  else
-    print("setlist: no save file found, using defaults")
   end
+  state.current_bank = data.current_bank or 1
+  state.current_slot = data.current_slot or 1
+  state.midi_device = data.midi_device or 1
+  print("setlist: loaded from " .. SAVE_FILE)
 end
 
 -- ---------------------------------------------------------------------------
@@ -130,9 +138,31 @@ end
 -- ---------------------------------------------------------------------------
 
 local function get_script_name(script_path)
-  -- Extract script name from path like "code/awake/awake.lua" -> "awake"
-  local name = script_path:match("code/([^/]+)/")
-  return name or script_path
+  return script_path:match("([^/]+)/[^/]+%.lua$") or script_path
+end
+
+local function index_of(t, val)
+  for i, v in ipairs(t) do
+    if v == val then return i end
+  end
+  return 1
+end
+
+-- Build list of available scripts by scanning dust/code
+local function get_script_list()
+  local list = {""}
+  local pattern = _path.code .. "*/*.lua"
+  local found = norns.system_glob(pattern)
+  if found then
+    for _, p in ipairs(found) do
+      -- Only include files where filename matches parent folder (e.g. awake/awake.lua)
+      local folder, file = p:match("/([^/]+)/([^/]+)%.lua$")
+      if folder and file and folder == file then
+        table.insert(list, folder .. "/" .. folder .. ".lua")
+      end
+    end
+  end
+  return list
 end
 
 local function fire_slot(bank, slot_num)
@@ -142,14 +172,11 @@ local function fire_slot(bank, slot_num)
   state.current_bank = bank
   state.current_slot = slot_num
 
-  local current_script = norns.state.script or ""
-  local target_script = slot.script
-  -- Match script identity: "code/awake/awake.lua" vs "awake/awake"
-  local target_base = target_script:gsub("%.lua$", "")
-
-  -- If same script is already loaded, just swap the PSET — instant, no gap
-  if current_script:find(target_base, 1, true) then
-    print("setlist: same script, fast PSET swap -> " .. slot.pset)
+  -- Check if same script is already running → fast PSET-only swap
+  local current = norns.state.script or ""
+  local target_base = slot.script:gsub("%.lua$", "")
+  if current:find(target_base, 1, true) then
+    print("setlist: same script — fast PSET swap to slot " .. slot.pset)
     params:read(slot.pset)
     params:bang()
     if slot.clock_mode == "internal" then
@@ -158,20 +185,20 @@ local function fire_slot(bank, slot_num)
     return
   end
 
-  -- Otherwise do the full script load
-  print(string.format("setlist: firing bank %d slot %d -> %s pset:%d",
+  -- Full script load
+  print(string.format("setlist: firing b%d s%d → %s (pset %d)",
     bank, slot_num, slot.script, slot.pset))
   state.pending_pset = slot.pset
   state.pending_bpm = slot.bpm
   state.pending_clock = slot.clock_mode
 
-  local full_path = _path.code .. slot.script:gsub("^code/", "")
-  if util.file_exists(_path.home .. "dust/" .. slot.script) then
-    norns.script.load(slot.script)
-  elseif util.file_exists(full_path) then
-    norns.script.load("code/" .. slot.script:gsub("^code/", ""))
+  -- Resolve path: accept both "awake/awake.lua" and "code/awake/awake.lua"
+  local script_path = slot.script:gsub("^code/", "")
+  local full = _path.code .. script_path
+  if util.file_exists(full) then
+    norns.script.load("code/" .. script_path)
   else
-    print("setlist: ERROR script not found: " .. slot.script)
+    print("setlist: ERROR script not found: " .. full)
     state.pending_pset = nil
     state.pending_bpm = nil
     state.pending_clock = nil
@@ -187,13 +214,19 @@ local midi_watcher = nil
 local function setup_midi()
   if midi_watcher then
     midi_watcher.event = nil
+    midi_watcher = nil
   end
-  midi_watcher = midi.connect(state.midi_device)
+  local ok, dev = pcall(midi.connect, state.midi_device)
+  if not ok or not dev then
+    print("setlist: could not connect to MIDI port " .. state.midi_device)
+    return
+  end
+  midi_watcher = dev
   midi_watcher.event = function(data)
-    local msg = midi.to_msg(data)
+    local ok2, msg = pcall(midi.to_msg, data)
+    if not ok2 then return end
     if msg.type == "program_change" then
-      local pc = msg.val -- 0-127
-      -- Scan all slots in current bank for a matching midi_pc trigger
+      local pc = msg.val
       for s = 1, NUM_SLOTS do
         local slot = state.banks[state.current_bank][s]
         if slot.trigger_type == "midi_pc" and slot.midi_pc == pc then
@@ -201,7 +234,6 @@ local function setup_midi()
           return
         end
       end
-      -- Also scan all banks if no match in current bank
       for b = 1, NUM_BANKS do
         for s = 1, NUM_SLOTS do
           local slot = state.banks[b][s]
@@ -213,6 +245,7 @@ local function setup_midi()
       end
     end
   end
+  print("setlist: MIDI watcher on port " .. state.midi_device)
 end
 
 -- ---------------------------------------------------------------------------
@@ -244,43 +277,43 @@ end
 -- ---------------------------------------------------------------------------
 
 mod.hook.register("system_post_startup", "setlist_startup", function()
+  DATA_PATH = _path.data .. "setlist/"
+  SAVE_FILE = DATA_PATH .. "setlist.lua"
   init_banks()
   load_data()
   setup_midi()
   setup_keyboard()
-  print("setlist: mod active")
+  print("setlist: mod active ✓")
 end)
 
--- After each script loads and runs init(), apply our pending actions
 mod.hook.register("script_post_init", "setlist_post_init", function()
-  -- Re-chain keyboard since the new script may have overwritten keyboard.code
   setup_keyboard()
+  setup_midi()
 
   if state.pending_pset then
-    -- Small delay to ensure params are fully registered before reading pset
+    local pset_to_load = state.pending_pset
+    local bpm_to_set = state.pending_bpm
+    local clock_to_set = state.pending_clock
+    state.pending_pset = nil
+    state.pending_bpm = nil
+    state.pending_clock = nil
+
     clock.run(function()
-      clock.sleep(0.2)
-      print("setlist: loading pset " .. state.pending_pset)
-      params:read(state.pending_pset)
+      clock.sleep(0.3)
+      print("setlist: applying pset " .. pset_to_load)
+      params:read(pset_to_load)
       params:bang()
-
-      if state.pending_clock then
-        if state.pending_clock == "internal" then
-          params:set("clock_source", 1) -- 1 = internal on most norns builds
-          if state.pending_bpm then
-            params:set("clock_tempo", state.pending_bpm)
-            print("setlist: set BPM to " .. state.pending_bpm)
-          end
-        else
-          -- external: set clock source to midi (value 2 on most builds)
-          params:set("clock_source", 2)
-          print("setlist: set clock to external")
+      clock.sleep(0.1)
+      if clock_to_set == "internal" then
+        params:set("clock_source", 1)
+        if bpm_to_set then
+          params:set("clock_tempo", bpm_to_set)
+          print("setlist: BPM → " .. bpm_to_set)
         end
+      elseif clock_to_set == "external" then
+        params:set("clock_source", 2)
+        print("setlist: clock → external MIDI")
       end
-
-      state.pending_pset = nil
-      state.pending_bpm = nil
-      state.pending_clock = nil
     end)
   end
 end)
@@ -307,14 +340,6 @@ local EDIT_FIELDS = {
   "script", "pset", "trigger_type", "key", "midi_pc", "clock_mode", "bpm"
 }
 local edit_field = 1
-
--- Helper: get index of value in table
-local function index_of(t, val)
-  for i, v in ipairs(t) do
-    if v == val then return i end
-  end
-  return 1
-end
 
 local m = {}
 
@@ -404,19 +429,9 @@ m.enc = function(n, d)
         idx = util.clamp(idx + d, 1, #CLOCK_OPTIONS)
         slot.clock_mode = CLOCK_OPTIONS[idx]
       elseif field == "script" then
-        -- Cycle through available scripts on disk
-        local scripts = norns.system_glob(_path.code .. "*//*.lua")
-        -- Filter to only top-level script files (name matches folder)
-        local script_list = {""}
-        for _, path in ipairs(scripts) do
-          local folder, file = path:match("code/([^/]+)/([^/]+)%.lua$")
-          if folder and file and folder == file then
-            table.insert(script_list, folder .. "/" .. folder .. ".lua")
-          end
-        end
-        local idx = index_of(script_list, slot.script)
-        idx = util.clamp(idx + d, 1, #script_list)
-        slot.script = script_list[idx]
+        local list = get_script_list()
+        local idx = index_of(list, slot.script)
+        slot.script = list[util.clamp(idx + d, 1, #list)]
       end
 
     elseif menu_page == PAGE_SETTINGS then
