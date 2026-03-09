@@ -42,6 +42,8 @@ local state = {
   pending_pset = nil,   -- pset to load after script_post_init fires
   pending_bpm = nil,    -- bpm to set after script_post_init fires
   pending_clock = nil,  -- "internal" or "external"
+  learning_key = false,
+  learning_midi_pc = false,
 }
 
 -- Default slot structure
@@ -215,8 +217,19 @@ local function setup_midi()
   midi_watcher.event = function(data)
     local ok2, msg = pcall(midi.to_msg, data)
     if not ok2 then return end
-    if msg.type == "program_change" then
+    if msg and msg.type == "program_change" then
       local pc = msg.val
+      -- Learn mode: capture next PC for midi_pc field
+      if state.learning_midi_pc then
+        local slot = state.banks[state.current_bank][state.current_slot]
+        if slot then
+          slot.midi_pc = pc
+          state.learning_midi_pc = false
+          print("setlist: learned MIDI PC " .. pc)
+        end
+        mod.menu.redraw()
+        return
+      end
       for s = 1, NUM_SLOTS do
         local slot = state.banks[state.current_bank][s]
         if slot.trigger_type == "midi_pc" and slot.midi_pc == pc then
@@ -248,9 +261,20 @@ local function setup_keyboard()
   local existing = keyboard.code  -- capture CURRENT handler, not startup handler
   keyboard.code = function(code, value)
     if value == 1 then
+      -- Learn mode: capture next keypress for key field
+      if state.learning_key then
+        local slot = state.banks[state.current_bank][state.current_slot]
+        if slot then
+          slot.key = tostring(code)
+          state.learning_key = false
+          print("setlist: learned key " .. tostring(code))
+        end
+        mod.menu.redraw()
+        return
+      end
       for s = 1, NUM_SLOTS do
         local slot = state.banks[state.current_bank][s]
-        if slot.trigger_type == "keyboard" and slot.key == code then
+        if slot.trigger_type == "keyboard" and slot.key == tostring(code) then
           fire_slot(state.current_bank, s)
           return
         end
@@ -317,19 +341,32 @@ end)
 -- ---------------------------------------------------------------------------
 
 -- Menu pages
-local PAGE_BANK    = 1
-local PAGE_SLOT    = 2
-local PAGE_EDIT    = 3
-local PAGE_SETTINGS = 4
+local PAGE_BANK         = 1
+local PAGE_SLOT         = 2
+local PAGE_EDIT         = 3
+local PAGE_SETTINGS     = 4
+local PAGE_SCRIPT_BROWSE = 5
 
 local menu_page = PAGE_BANK
 local menu_pos = 1  -- position within current page
-
--- Edit page fields
-local EDIT_FIELDS = {
-  "script", "pset", "trigger_type", "key", "midi_pc", "clock_mode", "bpm"
-}
 local edit_field = 1
+local script_browse_pos = 1  -- position in script list when browsing
+
+-- Build edit fields dynamically based on slot state (conditional visibility)
+local function get_edit_fields(slot)
+  local fields = {"script", "pset", "trigger_type"}
+  if slot.trigger_type == "keyboard" then
+    table.insert(fields, "key")
+  elseif slot.trigger_type == "midi_pc" then
+    table.insert(fields, "midi_pc")
+  end
+  table.insert(fields, "clock_mode")
+  if slot.clock_mode == "internal" then
+    table.insert(fields, "bpm")
+  end
+  table.insert(fields, "fire")  -- K3 on this field fires the slot
+  return fields
+end
 
 local m = {}
 
@@ -337,13 +374,18 @@ m.key = function(n, z)
   if z ~= 1 then return end
 
   if n == 2 then
+    -- K2: back
     if menu_page == PAGE_BANK then
       mod.menu.exit()
     elseif menu_page == PAGE_SLOT then
       menu_page = PAGE_BANK
+      menu_pos = state.current_bank
     elseif menu_page == PAGE_EDIT then
       menu_page = PAGE_SLOT
+      menu_pos = state.current_slot
       save_data()
+    elseif menu_page == PAGE_SCRIPT_BROWSE then
+      menu_page = PAGE_EDIT
     elseif menu_page == PAGE_SETTINGS then
       menu_page = PAGE_BANK
       save_data()
@@ -351,54 +393,67 @@ m.key = function(n, z)
     mod.menu.redraw()
 
   elseif n == 3 then
+    -- K3: select / action
     if menu_page == PAGE_BANK then
       state.current_bank = menu_pos
       menu_page = PAGE_SLOT
       menu_pos = state.current_slot
-      mod.menu.redraw()
     elseif menu_page == PAGE_SLOT then
       state.current_slot = menu_pos
       menu_page = PAGE_EDIT
       edit_field = 1
-      mod.menu.redraw()
     elseif menu_page == PAGE_EDIT then
-      -- K3 on edit: fire this slot immediately
-      fire_slot(state.current_bank, state.current_slot)
+      local slot = state.banks[state.current_bank][state.current_slot]
+      local fields = get_edit_fields(slot)
+      local field = fields[edit_field]
+      if field == "script" then
+        -- K3 opens script browse
+        local list = get_script_list()
+        script_browse_pos = util.clamp(index_of(list, slot.script), 1, #list)
+        menu_page = PAGE_SCRIPT_BROWSE
+      elseif field == "key" then
+        state.learning_key = true
+        print("setlist: press a key to learn...")
+      elseif field == "midi_pc" then
+        state.learning_midi_pc = true
+        print("setlist: send MIDI PC to learn...")
+      elseif field == "fire" then
+        fire_slot(state.current_bank, state.current_slot)
+      end
+    elseif menu_page == PAGE_SCRIPT_BROWSE then
+      -- K3 select script
+      local list = get_script_list()
+      local slot = state.banks[state.current_bank][state.current_slot]
+      slot.script = list[script_browse_pos]
+      menu_page = PAGE_EDIT
     elseif menu_page == PAGE_SETTINGS then
       -- nothing on K3 for settings
     end
+    mod.menu.redraw()
   end
 end
 
 m.enc = function(n, d)
+  local slot = state.banks[state.current_bank][state.current_slot]
+
   if n == 2 then
-    -- Scroll through list items
-    if menu_page == PAGE_BANK then
-      menu_pos = util.clamp(menu_pos + d, 1, NUM_BANKS)
-    elseif menu_page == PAGE_SLOT then
-      menu_pos = util.clamp(menu_pos + d, 1, NUM_SLOTS)
-    elseif menu_page == PAGE_EDIT then
-      edit_field = util.clamp(edit_field + d, 1, #EDIT_FIELDS)
-    elseif menu_page == PAGE_SETTINGS then
-      -- scroll setting rows (just midi_device for now)
+    -- E2: scroll through fields (edit page only)
+    if menu_page == PAGE_EDIT then
+      local fields = get_edit_fields(slot)
+      edit_field = util.clamp(edit_field + d, 1, #fields)
     end
 
   elseif n == 3 then
-    -- Change value of selected item
-    local slot = state.banks[state.current_bank][state.current_slot]
-
+    -- E3: scroll/change value
     if menu_page == PAGE_BANK then
-      -- E3 on bank page: switch active bank without entering slot page
-      state.current_bank = util.clamp(state.current_bank + d, 1, NUM_BANKS)
-      menu_pos = state.current_bank
+      menu_pos = util.clamp(menu_pos + d, 1, NUM_BANKS)
 
     elseif menu_page == PAGE_SLOT then
-      -- E3 on slot page: fire the hovered slot
-      local s = util.clamp(menu_pos + d, 1, NUM_SLOTS)
-      menu_pos = s
+      menu_pos = util.clamp(menu_pos + d, 1, NUM_SLOTS)
 
     elseif menu_page == PAGE_EDIT then
-      local field = EDIT_FIELDS[edit_field]
+      local fields = get_edit_fields(slot)
+      local field = fields[edit_field]
 
       if field == "pset" then
         slot.pset = util.clamp(slot.pset + d, 1, 99)
@@ -408,21 +463,32 @@ m.enc = function(n, d)
         slot.midi_pc = util.clamp(slot.midi_pc + d, 0, 127)
       elseif field == "trigger_type" then
         local idx = index_of(TRIGGER_TYPE_OPTIONS, slot.trigger_type)
-        idx = util.clamp(idx + d, 1, #TRIGGER_TYPE_OPTIONS)
-        slot.trigger_type = TRIGGER_TYPE_OPTIONS[idx]
+        slot.trigger_type = TRIGGER_TYPE_OPTIONS[util.clamp(idx + d, 1, #TRIGGER_TYPE_OPTIONS)]
+        edit_field = util.clamp(edit_field, 1, #get_edit_fields(slot))
       elseif field == "key" then
-        local idx = index_of(KEY_OPTIONS, slot.key)
-        idx = util.clamp(idx + d, 1, #KEY_OPTIONS)
-        slot.key = KEY_OPTIONS[idx]
+        local key_opts = KEY_OPTIONS
+        if slot.key ~= "" and slot.key ~= "none" and index_of(KEY_OPTIONS, slot.key) == 1 then
+          key_opts = {"none", slot.key}
+          for _, k in ipairs(KEY_OPTIONS) do
+            if k ~= "none" and k ~= slot.key then table.insert(key_opts, k) end
+          end
+        end
+        local idx = index_of(key_opts, slot.key)
+        slot.key = key_opts[util.clamp(idx + d, 1, #key_opts)]
       elseif field == "clock_mode" then
         local idx = index_of(CLOCK_OPTIONS, slot.clock_mode)
-        idx = util.clamp(idx + d, 1, #CLOCK_OPTIONS)
-        slot.clock_mode = CLOCK_OPTIONS[idx]
+        slot.clock_mode = CLOCK_OPTIONS[util.clamp(idx + d, 1, #CLOCK_OPTIONS)]
+        edit_field = util.clamp(edit_field, 1, #get_edit_fields(slot))
       elseif field == "script" then
         local list = get_script_list()
         local idx = index_of(list, slot.script)
         slot.script = list[util.clamp(idx + d, 1, #list)]
       end
+      -- fire field is display-only, no E3 change
+
+    elseif menu_page == PAGE_SCRIPT_BROWSE then
+      local list = get_script_list()
+      script_browse_pos = util.clamp(script_browse_pos + d, 1, #list)
 
     elseif menu_page == PAGE_SETTINGS then
       state.midi_device = util.clamp(state.midi_device + d, 1, 4)
@@ -441,22 +507,14 @@ m.redraw = function()
   if menu_page == PAGE_BANK then
     screen.level(15)
     screen.move(2, 8)
-    screen.text("SETLIST  banks")
-    for i = 1, math.min(NUM_BANKS, 7) do
-      local b = i
-      local y = 8 + (i * 8)
-      if b == menu_pos then
-        screen.level(15)
-        screen.move(2, y)
-        screen.text("> bank " .. b)
-      else
-        screen.level(4)
-        screen.move(8, y)
-        screen.text("bank " .. b)
-      end
-    end
-    -- Show current active bank/slot at bottom
+    screen.text("SETLIST  bank")
+    screen.level(15)
+    screen.move(2, 24)
+    screen.text("> " .. menu_pos)
     screen.level(3)
+    screen.move(2, 50)
+    screen.text("E3: change  K3: select")
+    screen.level(2)
     screen.move(2, 62)
     screen.text("active: b" .. state.current_bank .. " s" .. state.current_slot)
 
@@ -464,10 +522,12 @@ m.redraw = function()
     screen.level(15)
     screen.move(2, 8)
     screen.text("bank " .. state.current_bank .. "  slots")
-    for i = 1, math.min(NUM_SLOTS, 7) do
-      local s = i
+    local win_start = math.max(1, math.min(menu_pos - 3, NUM_SLOTS - 6))
+    for i = 0, 6 do
+      local s = win_start + i
+      if s > NUM_SLOTS then break end
       local slot = state.banks[state.current_bank][s]
-      local y = 8 + (i * 8)
+      local y = 16 + (i * 8)
       local label = s .. ": "
       if slot.script ~= "" then
         label = label .. get_script_name(slot.script)
@@ -485,43 +545,86 @@ m.redraw = function()
         screen.text("> " .. label)
       else
         screen.level(4)
-        screen.move(4, y)
+        screen.move(8, y)
         screen.text(label)
       end
     end
+    screen.level(3)
+    screen.move(2, 62)
+    screen.text("E3: scroll  K3: select slot")
+
+  elseif menu_page == PAGE_SCRIPT_BROWSE then
+    screen.level(15)
+    screen.move(2, 8)
+    screen.text("select script")
+    local list = get_script_list()
+    local win_start = math.max(1, math.min(script_browse_pos - 3, #list - 6))
+    for i = 0, 6 do
+      local idx = win_start + i
+      if idx > #list then break end
+      local y = 16 + (i * 8)
+      local label = idx == 1 and "(none)" or get_script_name(list[idx])
+      if idx == script_browse_pos then
+        screen.level(15)
+        screen.move(2, y)
+        screen.text("> " .. label)
+      else
+        screen.level(4)
+        screen.move(8, y)
+        screen.text(label)
+      end
+    end
+    screen.level(3)
+    screen.move(2, 62)
+    screen.text("E3: scroll  K3: select  K2: back")
 
   elseif menu_page == PAGE_EDIT then
     local slot = state.banks[state.current_bank][state.current_slot]
+    local fields = get_edit_fields(slot)
     screen.level(15)
     screen.move(2, 8)
     screen.text("b" .. state.current_bank .. " s" .. state.current_slot .. "  edit")
 
-    local fields_display = {
-      {"script",       slot.script ~= "" and get_script_name(slot.script) or "---"},
-      {"pset",         tostring(slot.pset)},
-      {"trigger",      slot.trigger_type},
-      {"key",          slot.key},
-      {"midi pc",      tostring(slot.midi_pc)},
-      {"clock",        slot.clock_mode},
-      {"bpm",          tostring(slot.bpm)},
+    local field_names = {
+      script = "script", pset = "pset", trigger_type = "trigger",
+      key = "key", midi_pc = "midi pc", clock_mode = "clock", bpm = "bpm", fire = "fire"
     }
+    local function field_label(field)
+      if field == "script" then
+        return slot.script ~= "" and get_script_name(slot.script) or "---"
+      elseif field == "pset" then return tostring(slot.pset)
+      elseif field == "trigger_type" then return slot.trigger_type
+      elseif field == "key" then return slot.key
+      elseif field == "midi_pc" then return tostring(slot.midi_pc)
+      elseif field == "clock_mode" then return slot.clock_mode
+      elseif field == "bpm" then return tostring(slot.bpm)
+      elseif field == "fire" then return "[K3]"
+      end
+      return ""
+    end
 
-    for i, fd in ipairs(fields_display) do
+    for i, field in ipairs(fields) do
       local y = 8 + (i * 8)
+      local label = field_label(field)
+      if field == "key" and state.learning_key then
+        label = "< learn... >"
+      elseif field == "midi_pc" and state.learning_midi_pc then
+        label = "< learn... >"
+      end
+      local name = field_names[field] or field
       if i == edit_field then
         screen.level(15)
         screen.move(2, y)
-        screen.text("> " .. fd[1] .. ": " .. fd[2])
+        screen.text("> " .. name .. ": " .. label)
       else
         screen.level(4)
-        screen.move(4, y)
-        screen.text(fd[1] .. ": " .. fd[2])
+        screen.move(8, y)
+        screen.text(name .. ": " .. label)
       end
     end
-
     screen.level(2)
     screen.move(2, 62)
-    screen.text("K3: fire slot now")
+    screen.text("E2: field  E3: change  K3: action")
 
   elseif menu_page == PAGE_SETTINGS then
     screen.level(15)
