@@ -68,10 +68,8 @@ local function init_banks()
 end
 
 -- ---------------------------------------------------------------------------
--- Persistence — plain Lua serialization via serpent (ships with norns)
+-- Persistence — tab.save/tab.load (norns built-in, no extra requires)
 -- ---------------------------------------------------------------------------
-
-local serpent = require 'serpent'
 
 local function ensure_data_dir()
   if DATA_PATH and not util.file_exists(DATA_PATH) then
@@ -82,16 +80,13 @@ end
 local function save_data()
   if not DATA_PATH then return end
   ensure_data_dir()
-  local payload = {
+  local err = tab.save({
     banks = state.banks,
     current_bank = state.current_bank,
     current_slot = state.current_slot,
     midi_device = state.midi_device,
-  }
-  local f = io.open(SAVE_FILE, 'w')
-  if f then
-    f:write("return " .. serpent.block(payload, {comment = false}))
-    f:close()
+  }, SAVE_FILE)
+  if not err or type(err) ~= "string" then
     print("setlist: saved -> " .. SAVE_FILE)
   else
     print("setlist: ERROR could not write " .. SAVE_FILE)
@@ -104,33 +99,28 @@ local function load_data()
     print("setlist: no save file, using defaults")
     return
   end
-  local fn, err = loadfile(SAVE_FILE)
-  if not fn then
-    print("setlist: ERROR loading save file: " .. tostring(err))
-    return
-  end
-  local ok, data = pcall(fn)
-  if not ok or type(data) ~= "table" then
-    print("setlist: ERROR parsing save file")
-    return
-  end
-  if data.banks then
-    for b = 1, NUM_BANKS do
-      if data.banks[b] then
-        for s = 1, NUM_SLOTS do
-          if data.banks[b][s] then
-            local slot = default_slot()
-            for k, v in pairs(data.banks[b][s]) do slot[k] = v end
-            state.banks[b][s] = slot
+  local decoded = tab.load(SAVE_FILE)
+  if decoded and type(decoded) == "table" then
+    if decoded.banks then
+      for b = 1, NUM_BANKS do
+        if decoded.banks[b] then
+          for s = 1, NUM_SLOTS do
+            if decoded.banks[b][s] then
+              local slot = default_slot()
+              for k, v in pairs(decoded.banks[b][s]) do slot[k] = v end
+              state.banks[b][s] = slot
+            end
           end
         end
       end
     end
+    state.current_bank = decoded.current_bank or 1
+    state.current_slot = decoded.current_slot or 1
+    state.midi_device = decoded.midi_device or 1
+    print("setlist: loaded from " .. SAVE_FILE)
+  else
+    print("setlist: ERROR parsing save file, using defaults")
   end
-  state.current_bank = data.current_bank or 1
-  state.current_slot = data.current_slot or 1
-  state.midi_device = data.midi_device or 1
-  print("setlist: loaded from " .. SAVE_FILE)
 end
 
 -- ---------------------------------------------------------------------------
@@ -278,7 +268,7 @@ end
 
 mod.hook.register("system_post_startup", "setlist_startup", function()
   DATA_PATH = _path.data .. "setlist/"
-  SAVE_FILE = DATA_PATH .. "setlist.lua"
+  SAVE_FILE = DATA_PATH .. "setlist.data"
   init_banks()
   load_data()
   setup_midi()
