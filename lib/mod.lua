@@ -6,7 +6,6 @@
 -- Trigger fires: script load → PSET recall → clock config.
 
 local mod = require 'core/mods'
-local json = require 'json' -- norns ships with a json lib via util
 
 -- ---------------------------------------------------------------------------
 -- Constants
@@ -15,7 +14,7 @@ local json = require 'json' -- norns ships with a json lib via util
 local NUM_BANKS = 16
 local NUM_SLOTS = 16
 local DATA_PATH = _path.data .. 'setlist/'
-local SAVE_FILE = DATA_PATH .. 'setlist.json'
+local SAVE_FILE = DATA_PATH .. 'setlist.lua'
 
 -- Available keyboard trigger keys (F1-F4 are reserved by system, so F6-F12 + others)
 local KEY_OPTIONS = {
@@ -79,17 +78,16 @@ local function ensure_data_dir()
   end
 end
 
+-- Use tab.save/tab.load (norns built-in) for plain Lua table serialization — no external dep
 local function save_data()
   ensure_data_dir()
-  local f = io.open(SAVE_FILE, 'w')
-  if f then
-    f:write(json.encode({
-      banks = state.banks,
-      current_bank = state.current_bank,
-      current_slot = state.current_slot,
-      midi_device = state.midi_device,
-    }))
-    f:close()
+  local ok = tab.save({
+    banks = state.banks,
+    current_bank = state.current_bank,
+    current_slot = state.current_slot,
+    midi_device = state.midi_device,
+  }, SAVE_FILE)
+  if ok then
     print("setlist: saved to " .. SAVE_FILE)
   else
     print("setlist: ERROR could not write " .. SAVE_FILE)
@@ -98,19 +96,14 @@ end
 
 local function load_data()
   if util.file_exists(SAVE_FILE) then
-    local f = io.open(SAVE_FILE, 'r')
-    if f then
-      local raw = f:read('*all')
-      f:close()
-      local ok, decoded = pcall(json.decode, raw)
-      if ok and decoded then
+    local decoded = tab.load(SAVE_FILE)
+    if decoded then
         -- Merge loaded data, filling missing slots with defaults
         if decoded.banks then
           for b = 1, NUM_BANKS do
             if decoded.banks[b] then
               for s = 1, NUM_SLOTS do
                 if decoded.banks[b][s] then
-                  -- Merge: keep defaults for any missing keys
                   local loaded = decoded.banks[b][s]
                   local slot = default_slot()
                   for k, v in pairs(loaded) do slot[k] = v end
@@ -124,9 +117,8 @@ local function load_data()
         state.current_slot = decoded.current_slot or 1
         state.midi_device = decoded.midi_device or 1
         print("setlist: loaded from " .. SAVE_FILE)
-      else
-        print("setlist: ERROR parsing save file, using defaults")
-      end
+    else
+      print("setlist: ERROR parsing save file, using defaults")
     end
   else
     print("setlist: no save file found, using defaults")
@@ -145,24 +137,35 @@ end
 
 local function fire_slot(bank, slot_num)
   local slot = state.banks[bank][slot_num]
-  if not slot or slot.script == "" then
-    print("setlist: slot " .. bank .. "/" .. slot_num .. " has no script configured")
-    return
-  end
+  if not slot or slot.script == "" then return end
 
-  print(string.format("setlist: firing bank %d slot %d -> %s pset:%d",
-    bank, slot_num, slot.script, slot.pset))
-
-  -- Store pending actions for script_post_init hook
-  state.pending_pset = slot.pset
-  state.pending_bpm = slot.bpm
-  state.pending_clock = slot.clock_mode
   state.current_bank = bank
   state.current_slot = slot_num
 
-  -- Load the script (this triggers the full load cycle)
+  local current_script = norns.state.script or ""
+  local target_script = slot.script
+  -- Match script identity: "code/awake/awake.lua" vs "awake/awake"
+  local target_base = target_script:gsub("%.lua$", "")
+
+  -- If same script is already loaded, just swap the PSET — instant, no gap
+  if current_script:find(target_base, 1, true) then
+    print("setlist: same script, fast PSET swap -> " .. slot.pset)
+    params:read(slot.pset)
+    params:bang()
+    if slot.clock_mode == "internal" then
+      params:set("clock_tempo", slot.bpm)
+    end
+    return
+  end
+
+  -- Otherwise do the full script load
+  print(string.format("setlist: firing bank %d slot %d -> %s pset:%d",
+    bank, slot_num, slot.script, slot.pset))
+  state.pending_pset = slot.pset
+  state.pending_bpm = slot.bpm
+  state.pending_clock = slot.clock_mode
+
   local full_path = _path.code .. slot.script:gsub("^code/", "")
-  -- Handle both "code/awake/awake.lua" and "awake/awake.lua" formats
   if util.file_exists(_path.home .. "dust/" .. slot.script) then
     norns.script.load(slot.script)
   elseif util.file_exists(full_path) then
@@ -216,25 +219,22 @@ end
 -- Keyboard listener (injected via system_post_startup hook)
 -- ---------------------------------------------------------------------------
 
+-- Captures CURRENT handler at call time (not startup) so we properly re-chain
+-- each time a new script overwrites keyboard.code (e.g. in script_post_init).
 local function setup_keyboard()
-  -- We wrap keyboard.code so we don't fully replace it —
-  -- we chain to whatever the current script has set.
-  local prev_keyboard_code = keyboard.code
-
+  local existing = keyboard.code  -- capture CURRENT handler, not startup handler
   keyboard.code = function(code, value)
-    if value == 1 then -- key down only
-      -- Scan all slots in current bank for a matching keyboard trigger
+    if value == 1 then
       for s = 1, NUM_SLOTS do
         local slot = state.banks[state.current_bank][s]
         if slot.trigger_type == "keyboard" and slot.key == code then
           fire_slot(state.current_bank, s)
-          return -- consume the event
+          return
         end
       end
     end
-    -- Pass through to whatever the script defined
-    if prev_keyboard_code then
-      prev_keyboard_code(code, value)
+    if existing and existing ~= keyboard.code then
+      existing(code, value)
     end
   end
 end

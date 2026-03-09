@@ -55,5 +55,5 @@ Set which MIDI port to listen on for program change messages.
 - PSETs are loaded 200ms after `init()` completes to ensure all params are registered.
 - Clock source param IDs (`clock_source`, `clock_tempo`) match norns system defaults.
   If a script overrides these param IDs, clock settings may not apply.
-- setlist saves its configuration to `~/dust/data/setlist/setlist.json` on shutdown
+- setlist saves its configuration to `~/dust/data/setlist/setlist.lua` on shutdown
   and whenever you exit the edit page.
